@@ -156,6 +156,8 @@ jobs:
             -Dplatforms=android \
             -Dplatform-sdk-version="${ANDROID_PLATFORM_SDK}" \
             -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=disabled \
             -Dgallium-drivers= \
             -Dvulkan-drivers=freedreno \
             -Dfreedreno-kmds=kgsl \
