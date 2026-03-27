@@ -1,0 +1,226 @@
+name: Build Mesa Turnip Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_repo:
+        description: Mesa repository URL
+        required: true
+        default: https://gitlab.freedesktop.org/mesa/mesa.git
+        type: string
+      mesa_ref:
+        description: Mesa branch or tag to build
+        required: true
+        default: main
+        type: string
+      release_tag:
+        description: GitHub Release tag to create or update
+        required: true
+        type: string
+  push:
+    tags:
+      - "turnip-*"
+
+concurrency:
+  group: turnip-release-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_NDK_VERSION: r27d
+  ANDROID_PLATFORM_SDK: "34"
+  ADRENOTOOLS_DRIVER_NAME: libvulkan_freedreno.so
+
+jobs:
+  build:
+    name: Build Turnip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    outputs:
+      mesa_repo: ${{ steps.meta.outputs.mesa_repo }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      mesa_ref: ${{ steps.meta.outputs.mesa_ref }}
+      mesa_sha: ${{ steps.mesa.outputs.mesa_sha }}
+    steps:
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        env:
+          MESA_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.mesa_repo || '' }}
+          MESA_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.mesa_ref || '' }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+
+          MESA_REPO="${MESA_REPO:-https://gitlab.freedesktop.org/mesa/mesa.git}"
+          MESA_REF="${MESA_REF:-main}"
+          RELEASE_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+
+          echo "mesa_repo=$MESA_REPO" >> "$GITHUB_OUTPUT"
+          echo "mesa_ref=$MESA_REF" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=Turnip ${MESA_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            git \
+            glslang-tools \
+            libdrm-dev \
+            libexpat1-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-mako \
+            python3-packaging \
+            python3-yaml \
+            zip \
+            unzip \
+            xz-utils
+
+      - name: Prepare Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_VERSION="${ANDROID_NDK_VERSION}"
+          NDK_ROOT="$RUNNER_TEMP/android-ndk-${NDK_VERSION}"
+          NDK_ZIP="$RUNNER_TEMP/android-ndk-${NDK_VERSION}.zip"
+
+          if [[ ! -d "$NDK_ROOT" ]]; then
+            curl -fsSL -o "$NDK_ZIP" "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q "$NDK_ZIP" -d "$RUNNER_TEMP"
+          fi
+
+          mkdir -p "$NDK_ROOT/pkgconfig"
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Clone Mesa
+        id: mesa
+        shell: bash
+        env:
+          MESA_REPO: ${{ steps.meta.outputs.mesa_repo }}
+          MESA_REF: ${{ steps.meta.outputs.mesa_ref }}
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch "$MESA_REF" "$MESA_REPO" mesa
+          cd mesa
+          echo "mesa_sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Turnip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd mesa
+          cat > android-aarch64.cross <<EOF
+          [binaries]
+          ar = '${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-ar'
+          c = ['ccache', '${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang']
+          cpp = ['ccache', '${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+          strip = '${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-strip'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=${NDK_ROOT}/pkgconfig', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+
+          meson setup build-android-aarch64 \
+            --prefix /usr \
+            --cross-file android-aarch64.cross \
+            -Dplatforms=android \
+            -Dplatform-sdk-version="${ANDROID_PLATFORM_SDK}" \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Dbuildtype=release
+
+      - name: Build Turnip
+        run: |
+          cd mesa
+          meson compile -C build-android-aarch64
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MESA_REF='${{ steps.meta.outputs.mesa_ref }}'
+          MESA_SHA='${{ steps.mesa.outputs.mesa_sha }}'
+          SAFE_REF="${MESA_REF//\//-}"
+          PACKAGE_NAME="turnip-${SAFE_REF}-${MESA_SHA}-android-aarch64-adrenotools.zip"
+          STAGE_DIR="$PWD/stage"
+          DIST_DIR="$PWD/dist"
+
+          mkdir -p "$STAGE_DIR" "$DIST_DIR"
+          cd mesa
+          cp build-android-aarch64/src/freedreno/vulkan/${ADRENOTOOLS_DRIVER_NAME} "$STAGE_DIR/${ADRENOTOOLS_DRIVER_NAME}"
+          cat > "$STAGE_DIR/meta.json" <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Mesa Turnip Adreno Driver ${MESA_REF}",
+            "description": "Compiled from Mesa git commit ${MESA_SHA}.",
+            "author": "GitHub Actions",
+            "packageVersion": "1",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_REF}-${MESA_SHA}",
+            "minApi": 24,
+            "libraryName": "${ADRENOTOOLS_DRIVER_NAME}"
+          }
+          EOF
+          (cd "$STAGE_DIR" && zip -q -9 -r "$DIST_DIR/$PACKAGE_NAME" "${ADRENOTOOLS_DRIVER_NAME}" meta.json)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip-release
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: turnip-release
+          path: dist
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Turnip ${{ needs.build.outputs.mesa_ref }} (${{ needs.build.outputs.mesa_sha }})
+          body: |
+            Mesa repository: ${{ needs.build.outputs.mesa_repo }}
+            Mesa ref: ${{ needs.build.outputs.mesa_ref }}
+            Mesa commit: ${{ needs.build.outputs.mesa_sha }}
+            Built by GitHub Actions for Android aarch64 Turnip.
+          generate_release_notes: true
+          files: dist/*
