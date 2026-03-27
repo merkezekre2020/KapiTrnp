@@ -76,7 +76,6 @@ jobs:
             glslang-tools \
             libdrm-dev \
             libexpat1-dev \
-            meson \
             ninja-build \
             pkg-config \
             python3 \
@@ -86,6 +85,14 @@ jobs:
             zip \
             unzip \
             xz-utils
+
+      - name: Install Meson 1.4+
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --upgrade "meson>=1.4.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          meson --version
 
       - name: Prepare Android NDK
         shell: bash
